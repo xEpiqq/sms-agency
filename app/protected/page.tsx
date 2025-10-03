@@ -8,7 +8,6 @@ import { createClient } from "@/lib/supabase/client";
 // ---------- Types ----------
 type CsvMsg = { type: "csv"; zip: string; filename: string; dataBase64: string };
 type PhaseMsg = { type: "phase"; message: string };
-type StreamMsg = CsvMsg | PhaseMsg;
 
 type CsvDownload = {
   filename: string;
