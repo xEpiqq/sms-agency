@@ -88,7 +88,8 @@ type HomeownerRow = {
   firstName: string;
   lastName: string;
   propertyAddress: string;
-  mobile: string; // the first phone whose type === "W"
+  addy_two: string;                  // NEW: street-only (no city/state/zip)
+  mobile: string;                    // the first phone whose type === "W"
   phones: { number: string; type: string }[];
   emails: string[];
 };
@@ -285,6 +286,9 @@ async function fetchLeadsPage(token: string, begin = 0) {
 //   - Pick ONLY the homeowner contact for each property (not every household member)
 //   - Add "mobile" column: the FIRST phone whose type === "W" (per your mapping)
 //   - Drop rows with NO mobile
+//   - De-duplicate rows later (address+mobile)
+//   - FirstName cased to only the first letter upper, rest lower
+//   - New column addy_two = street portion before first comma
 
 function normalizePhone(num: string | number | null | undefined): string {
   if (num == null) return "";
@@ -312,6 +316,12 @@ function contactFirstLast(c: DMContact): { first: string; last: string } {
     }
   }
   return { first, last };
+}
+
+function capitalizeFirstOnly(s: string): string {
+  if (!s) return s;
+  const lower = s.toLowerCase();
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
 }
 
 /** Best-effort heuristic to detect the homeowner contact from a phone_numbers entry. */
@@ -363,6 +373,7 @@ function parseHomeownersFromPage(rawPage: LeadsPageResponse): HomeownerRow[] {
 
   for (const property of props) {
     const propertyAddress = (property?.property_address_full ?? "") || "";
+    const addy_two = propertyAddress.split(",")[0]?.trim() ?? ""; // NEW: street only
     const entry = selectHomeownerEntry(property);
     if (!entry) continue;
 
@@ -402,11 +413,14 @@ function parseHomeownersFromPage(rawPage: LeadsPageResponse): HomeownerRow[] {
       .filter((e) => e.length > 0);
 
     const { first, last } = contactFirstLast(c);
+    const firstNameCased = capitalizeFirstOnly(first || "");
+
     rows.push({
-      firstName: first || "",
+      firstName: firstNameCased,  // NEW: first letter upper, rest lower
       lastName: last || "",
       propertyAddress,
-      mobile,     // NEW column
+      addy_two,                   // NEW column value
+      mobile,                     // NEW column already present
       phones,
       emails,
     });
@@ -418,7 +432,7 @@ function parseHomeownersFromPage(rawPage: LeadsPageResponse): HomeownerRow[] {
 // ===============================
 // ===== CSV HELPERS (updated) ===
 //
-// Add "mobile" column (after propertyAddress), keep dynamic phones/emails.
+// Add "addy_two" column after propertyAddress; keep "mobile" column; keep dynamic phones/emails.
 function escapeCsvValue(value: unknown) {
   const s = String(value ?? "");
   if (s.includes(",") || s.includes('"') || s.includes("\n")) {
@@ -427,7 +441,7 @@ function escapeCsvValue(value: unknown) {
   return s;
 }
 function generateCsvHeaders(maxPhones: number, maxEmails: number) {
-  const base = ["firstName", "lastName", "propertyAddress", "mobile"]; // mobile added
+  const base = ["firstName", "lastName", "propertyAddress", "addy_two", "mobile"]; // NEW: addy_two inserted
   const phoneHeaders: string[] = [];
   for (let i = 1; i <= maxPhones; i++) {
     phoneHeaders.push(`phone${i}`, `phone${i}_type`);
@@ -443,6 +457,7 @@ function convertRowToCsv(row: HomeownerRow, maxPhones: number, maxEmails: number
     row.firstName,
     row.lastName,
     row.propertyAddress,
+    row.addy_two,  // NEW
     row.mobile,
   ];
 
@@ -467,7 +482,7 @@ async function exportHomeownersCsvString(
   const total = await getTotalLeadCount(token);
   if (total <= 0) {
     line(controller, `[${zip}] Nothing to export (0 leads).`);
-    return "firstName,lastName,propertyAddress,mobile\n"; // empty with headers
+    return "firstName,lastName,propertyAddress,addy_two,mobile\n"; // empty with headers (NEW header order)
   }
 
   const pages = Math.ceil(total / LEADS_PER_PAGE);
@@ -510,22 +525,37 @@ async function exportHomeownersCsvString(
   );
   await Promise.all(workers);
 
+  // Flatten
   const allRows = results.flat();
+
+  // ====== NEW: De-duplication ======
+  // Use a stable key of propertyAddress (case-insensitive, trimmed) + mobile.
+  const seen = new Set<string>();
+  const deduped: HomeownerRow[] = [];
+  for (const r of allRows) {
+    const key =
+      `${r.propertyAddress.trim().toLowerCase()}|${r.mobile.replace(/\D+/g, "")}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(r);
+  }
+
+  // Compute dynamic widths from deduped rows
   let maxPhones = 0;
   let maxEmails = 0;
-  for (const r of allRows) {
+  for (const r of deduped) {
     if (r.phones.length > maxPhones) maxPhones = r.phones.length;
     if (r.emails.length > maxEmails) maxEmails = r.emails.length;
   }
 
   const header = generateCsvHeaders(maxPhones, maxEmails);
   let csv = header + "\n";
-  for (const row of allRows) {
+  for (const row of deduped) {
     csv += convertRowToCsv(row, maxPhones, maxEmails) + "\n";
   }
   line(
     controller,
-    `[${zip}] CSV built with ${allRows.length} homeowner row(s) (phone pairs: ${maxPhones}, email cols: ${maxEmails}).`
+    `[${zip}] CSV built with ${deduped.length} homeowner row(s) after de-duplication (phone pairs: ${maxPhones}, email cols: ${maxEmails}).`
   );
   return csv;
 }
@@ -603,7 +633,7 @@ export async function POST(req: Request) {
           if (!okBuild) throw new Error(`[${zip}] Timed out waiting for build to reach ${buildCount}.`);
           line(controller, `[${zip}] Build complete.`);
 
-          // Export CSV (HOMEOWNER-ONLY, must have mobile "W")
+          // Export CSV (HOMEOWNER-ONLY, must have mobile "W"; with de-dup + addy_two + firstName casing)
           line(controller, `[${zip}] Starting export (homeowner-only)…`);
           const csv = await exportHomeownersCsvString(token, controller, zip);
 
