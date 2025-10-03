@@ -5,6 +5,11 @@ import { useRouter } from "next/navigation";
 import { InfoIcon, PlayIcon, XIcon, DownloadIcon, Trash2Icon } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
+// ---------- Types ----------
+type CsvMsg = { type: "csv"; zip: string; filename: string; dataBase64: string };
+type PhaseMsg = { type: "phase"; message: string };
+type StreamMsg = CsvMsg | PhaseMsg;
+
 type CsvDownload = {
   filename: string;
   url: string; // object URL
@@ -12,13 +17,38 @@ type CsvDownload = {
   zip: string;
 };
 
+type UserClaims = {
+  user_id: string;
+  email: string | null;
+};
+
+// Type guards
+function isCsvMsg(x: unknown): x is CsvMsg {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    (x as { type?: unknown }).type === "csv" &&
+    typeof (x as CsvMsg).zip === "string" &&
+    typeof (x as CsvMsg).filename === "string" &&
+    typeof (x as CsvMsg).dataBase64 === "string"
+  );
+}
+function isPhaseMsg(x: unknown): x is PhaseMsg {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    (x as { type?: unknown }).type === "phase" &&
+    typeof (x as PhaseMsg).message === "string"
+  );
+}
+
 export default function ProtectedPage() {
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
 
   // ---- Auth / claims ----
   const [isAuthed, setIsAuthed] = useState<boolean | null>(null);
-  const [claims, setClaims] = useState<Record<string, any> | null>(null);
+  const [claims, setClaims] = useState<UserClaims | null>(null);
 
   // ---- Pull Lists UI state ----
   const [token, setToken] = useState("");
@@ -49,7 +79,7 @@ export default function ProtectedPage() {
         if (mounted) {
           setClaims({
             user_id: userData.user.id,
-            email: userData.user.email,
+            email: userData.user.email ?? null,
           });
           setIsAuthed(true);
         }
@@ -136,7 +166,6 @@ export default function ProtectedPage() {
         body: JSON.stringify({
           token: token.trim(),
           zips,
-          // include tags/importToHL so we can wire up later if needed
           tags,
           importToHighLevel: importToHL,
         }),
@@ -145,6 +174,7 @@ export default function ProtectedPage() {
       if (!res.ok || !res.body) {
         const text = await res.text().catch(() => "");
         throw new Error(`Request failed: ${res.status} ${res.statusText}\n${text}`);
+        // eslint-disable-next-line no-unreachable
       }
 
       const reader = res.body.getReader();
@@ -168,8 +198,9 @@ export default function ProtectedPage() {
       if (buffer.trim().length) {
         handleStreamLine(buffer);
       }
-    } catch (err: any) {
-      setLogs((prev) => [...prev, `ERROR: ${String(err?.message || err)}`]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setLogs((prev) => [...prev, `ERROR: ${message}`]);
     } finally {
       setIsRunning(false);
     }
@@ -180,8 +211,9 @@ export default function ProtectedPage() {
 
     // Try JSON line first (NDJSON pattern for CSV payloads or structured events)
     try {
-      const obj = JSON.parse(line);
-      if (obj && obj.type === "csv" && typeof obj.zip === "string" && typeof obj.filename === "string" && typeof obj.dataBase64 === "string") {
+      const obj: unknown = JSON.parse(line);
+
+      if (isCsvMsg(obj)) {
         const bytes = atob(obj.dataBase64);
         const len = bytes.length;
         const arr = new Uint8Array(len);
@@ -196,7 +228,7 @@ export default function ProtectedPage() {
         return;
       }
 
-      if (obj && obj.type === "phase" && obj.message) {
+      if (isPhaseMsg(obj)) {
         setLogs((prev) => [...prev, obj.message]);
         return;
       }

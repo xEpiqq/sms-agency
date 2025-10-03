@@ -13,11 +13,84 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic"; // ensure no static optimization in dev
 
+// ========= Types =========
+
 type RunInput = {
   token: string;
   zips: string[];
   tags?: string[];
   importToHighLevel?: boolean;
+};
+
+type LeadsCountResponse = {
+  valid?: boolean;
+  error?: unknown;
+  results?: {
+    total_lead_count?: number;
+  };
+};
+
+type DMContact = {
+  given_name?: string | null;
+  middle_initial?: string | null;
+  surname?: string | null;
+  full_name?: string | null;
+
+  // plaintext phones + types
+  phone_1?: string | null;
+  phone_1_type?: string | null;
+  phone_2?: string | null;
+  phone_2_type?: string | null;
+  phone_3?: string | null;
+  phone_3_type?: string | null;
+
+  // plaintext emails
+  email_address_1?: string | null;
+  email_address_2?: string | null;
+  email_address_3?: string | null;
+
+  // possible hints to ownership
+  is_owner?: boolean;
+  is_primary?: boolean;
+  primary?: boolean;
+  homeowner?: boolean;
+  owner?: boolean;
+  role?: string | null;
+  type?: string | null;
+  relationship?: string | null;
+  contact_type?: string | null;
+};
+
+type PhoneNumberEntry = {
+  contact?: DMContact | null;
+  // Sometimes flags/strings can live on the entry itself
+  is_owner?: boolean;
+  is_primary?: boolean;
+  homeowner?: boolean;
+  role?: string | null;
+  type?: string | null;
+  relationship?: string | null;
+};
+
+type DMProperty = {
+  property_address_full?: string | null;
+  phone_numbers?: PhoneNumberEntry[] | null;
+};
+
+type LeadsPageResponse = {
+  error?: unknown;
+  results?: {
+    properties?: DMProperty[];
+  };
+};
+
+type HomeownerRow = {
+  firstName: string;
+  lastName: string;
+  propertyAddress: string;
+  mobile: string; // the first phone whose type === "W"
+  phones: { number: string; type: string }[];
+  emails: string[];
 };
 
 // =========================
@@ -28,24 +101,24 @@ const POLL_INTERVAL_MS = 5_000;
 const POLL_BUILD_TIMEOUT_MS = 60 * 60 * 1000;   // 60 minutes
 const POLL_DELETE_TIMEOUT_MS = 30 * 60 * 1000;  // 30 minutes
 
-const JSON_HEADERS = {
+const JSON_HEADERS: HeadersInit = {
   accept: "application/json",
   "content-type": "application/json",
 };
 
 // =========================
 // ====== HTTP UTILS =======
-async function httpPost(url: string, bodyObj: any) {
+async function httpPost<T = unknown>(url: string, bodyObj: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
-    headers: JSON_HEADERS as any,
+    headers: JSON_HEADERS,
     body: JSON.stringify(bodyObj),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} ${res.statusText} at ${url} :: ${text}`);
   }
-  return res.json();
+  return (await res.json()) as T;
 }
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -77,7 +150,7 @@ async function getTotalLeadCount(token: string): Promise<number> {
     get_updated_data: false,
     list_history_id: null,
   };
-  const json = await httpPost("https://api.dealmachine.com/v2/leads/", body);
+  const json = await httpPost<LeadsCountResponse>("https://api.dealmachine.com/v2/leads/", body);
   if (json?.error || !json?.valid) {
     throw new Error(`Count error: ${JSON.stringify(json)}`);
   }
@@ -126,14 +199,14 @@ async function issueSingleDeleteAllExact(token: string, currentCount: number) {
   };
   const res = await fetch(url, {
     method: "POST",
-    headers: JSON_HEADERS as any,
+    headers: JSON_HEADERS,
     body: JSON.stringify(body),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} ${res.statusText}\n${text}`);
   }
-  const data = await res.json();
+  const data = (await res.json()) as unknown;
   return data;
 }
 
@@ -167,15 +240,22 @@ async function buildListForZip(token: string, zip: string) {
     use_vision: false,
   };
 
-  const json = await httpPost("https://api.dealmachine.com/v2/list-builder/", body);
-  if (json?.error) {
+  const json = await httpPost<unknown>("https://api.dealmachine.com/v2/list-builder/", body);
+  // minimal defensive access:
+  const anyJson = json as Record<string, unknown>;
+  if ((anyJson as { error?: unknown }).error) {
     throw new Error(`List Builder error for ZIP ${zip}: ${JSON.stringify(json)}`);
   }
-  const buildCount = json?.results?.build_count ?? json?.results?.estimated_count ?? null;
+  const results = (anyJson as { results?: Record<string, unknown> }).results ?? {};
+  const buildCount =
+    (results as { build_count?: number }).build_count ??
+    (results as { estimated_count?: number }).estimated_count ??
+    null;
+
   if (buildCount == null) {
     throw new Error(`No build_count/estimated_count for ZIP ${zip}. Raw: ${JSON.stringify(json)}`);
   }
-  return { buildCount, listMeta: json?.results?.list ?? null };
+  return { buildCount };
 }
 
 async function fetchLeadsPage(token: string, begin = 0) {
@@ -194,7 +274,7 @@ async function fetchLeadsPage(token: string, begin = 0) {
     get_updated_data: false,
     list_history_id: null,
   };
-  const json = await httpPost("https://api.dealmachine.com/v2/leads/", body);
+  const json = await httpPost<LeadsPageResponse>("https://api.dealmachine.com/v2/leads/", body);
   return json;
 }
 
@@ -206,8 +286,8 @@ async function fetchLeadsPage(token: string, begin = 0) {
 //   - Add "mobile" column: the FIRST phone whose type === "W" (per your mapping)
 //   - Drop rows with NO mobile
 
-function normalizePhone(num: any) {
-  if (!num) return "";
+function normalizePhone(num: string | number | null | undefined): string {
+  if (num == null) return "";
   const s = String(num).trim();
   if (!s) return "";
   const hasPlus = s.startsWith("+");
@@ -215,12 +295,12 @@ function normalizePhone(num: any) {
   return hasPlus ? `+${digits}` : digits;
 }
 
-function contactFirstLast(c: any) {
-  let first = (c?.given_name || "").toString().trim();
-  let last = (c?.surname || "").toString().trim();
+function contactFirstLast(c: DMContact): { first: string; last: string } {
+  let first = (c?.given_name ?? "").toString().trim();
+  let last = (c?.surname ?? "").toString().trim();
 
   if (!first && !last) {
-    const full = (c?.full_name || "").toString().trim();
+    const full = (c?.full_name ?? "").toString().trim();
     if (full) {
       const parts = full.split(/\s+/).filter(Boolean);
       if (parts.length === 1) {
@@ -235,18 +315,18 @@ function contactFirstLast(c: any) {
 }
 
 /** Best-effort heuristic to detect the homeowner contact from a phone_numbers entry. */
-function isHomeownerContact(entry: any): boolean {
+function isHomeownerContact(entry: PhoneNumberEntry): boolean {
   const c = entry?.contact ?? {};
   const flags = [
-    c?.is_owner,
-    c?.is_primary,
-    c?.primary,
-    c?.homeowner,
-    c?.owner,
-    entry?.is_owner,
-    entry?.is_primary,
-    entry?.homeowner,
-  ].map(Boolean);
+    Boolean(c?.is_owner),
+    Boolean(c?.is_primary),
+    Boolean(c?.primary),
+    Boolean(c?.homeowner),
+    Boolean(c?.owner),
+    Boolean(entry?.is_owner),
+    Boolean(entry?.is_primary),
+    Boolean(entry?.homeowner),
+  ];
 
   const strings = [
     c?.role,
@@ -257,8 +337,8 @@ function isHomeownerContact(entry: any): boolean {
     entry?.type,
     entry?.relationship,
   ]
-    .filter((v) => typeof v === "string")
-    .map((s: string) => s.toLowerCase());
+    .filter((v): v is string => typeof v === "string" && v.length > 0)
+    .map((s) => s.toLowerCase());
 
   const anyOwnerWord = strings.some((s) => s.includes("owner") || s.includes("homeowner"));
   const anyFlag = flags.some(Boolean);
@@ -267,44 +347,33 @@ function isHomeownerContact(entry: any): boolean {
 }
 
 /** Pick the best homeowner entry (fallback to first). */
-function selectHomeownerEntry(property: any) {
+function selectHomeownerEntry(property: DMProperty): PhoneNumberEntry | null {
   const list = Array.isArray(property?.phone_numbers) ? property.phone_numbers : [];
   if (list.length === 0) return null;
-
-  // Prefer an entry that (heuristically) looks like a homeowner
-  const found = list.find((e: any) => isHomeownerContact(e));
+  const found = list.find((e) => isHomeownerContact(e));
   return found ?? list[0];
 }
 
-type HomeownerRow = {
-  firstName: string;
-  lastName: string;
-  propertyAddress: string;
-  mobile: string; // the first phone whose type === "W"
-  phones: { number: string; type: string }[];
-  emails: string[];
-};
-
 /** Parse ONLY the homeowner per property. Drop if no "W" (mobile) phone. */
-function parseHomeownersFromPage(rawPage: any): HomeownerRow[] {
+function parseHomeownersFromPage(rawPage: LeadsPageResponse): HomeownerRow[] {
   const props = rawPage?.results?.properties;
   if (!Array.isArray(props)) return [];
 
   const rows: HomeownerRow[] = [];
 
   for (const property of props) {
-    const propertyAddress = property?.property_address_full || "";
+    const propertyAddress = (property?.property_address_full ?? "") || "";
     const entry = selectHomeownerEntry(property);
     if (!entry) continue;
 
-    const c = entry?.contact;
+    const c = entry.contact;
     if (!c) continue;
 
     // Build phones set (from homeowner contact only)
-    const phoneTriples = [
-      { num: c.phone_1, typ: c.phone_1_type },
-      { num: c.phone_2, typ: c.phone_2_type },
-      { num: c.phone_3, typ: c.phone_3_type },
+    const phoneTriples: Array<{ num: string | null | undefined; typ: string | null | undefined }> = [
+      { num: c.phone_1 ?? null, typ: c.phone_1_type ?? null },
+      { num: c.phone_2 ?? null, typ: c.phone_2_type ?? null },
+      { num: c.phone_3 ?? null, typ: c.phone_3_type ?? null },
     ];
 
     const seen = new Set<string>();
@@ -312,7 +381,7 @@ function parseHomeownersFromPage(rawPage: any): HomeownerRow[] {
     let mobile = "";
 
     for (const p of phoneTriples) {
-      const n = normalizePhone(p?.num);
+      const n = normalizePhone(p.num);
       const t = (p?.typ ?? "").toString().trim();
       if (!n || seen.has(n)) continue;
       seen.add(n);
@@ -325,14 +394,12 @@ function parseHomeownersFromPage(rawPage: any): HomeownerRow[] {
     }
 
     // If NO mobile, drop this homeowner completely
-    if (!mobile) {
-      continue;
-    }
+    if (!mobile) continue;
 
     // Emails (from homeowner contact only)
     const emails = [c.email_address_1, c.email_address_2, c.email_address_3]
-      .map((e: any) => (e ?? "").toString().trim())
-      .filter(Boolean);
+      .map((e) => (e ?? "").toString().trim())
+      .filter((e) => e.length > 0);
 
     const { first, last } = contactFirstLast(c);
     rows.push({
@@ -352,7 +419,7 @@ function parseHomeownersFromPage(rawPage: any): HomeownerRow[] {
 // ===== CSV HELPERS (updated) ===
 //
 // Add "mobile" column (after propertyAddress), keep dynamic phones/emails.
-function escapeCsvValue(value: any) {
+function escapeCsvValue(value: unknown) {
   const s = String(value ?? "");
   if (s.includes(",") || s.includes('"') || s.includes("\n")) {
     return `"${s.replace(/"/g, '""')}"`;
@@ -372,7 +439,12 @@ function generateCsvHeaders(maxPhones: number, maxEmails: number) {
   return [...base, ...phoneHeaders, ...emailHeaders].join(",");
 }
 function convertRowToCsv(row: HomeownerRow, maxPhones: number, maxEmails: number) {
-  const fields: any[] = [row.firstName, row.lastName, row.propertyAddress, row.mobile]; // include mobile
+  const fields: Array<string> = [
+    row.firstName,
+    row.lastName,
+    row.propertyAddress,
+    row.mobile,
+  ];
 
   for (let i = 0; i < maxPhones; i++) {
     const p = row.phones[i];
@@ -411,7 +483,7 @@ async function exportHomeownersCsvString(
   const results: HomeownerRow[][] = [];
   let idx = 0;
 
-  async function worker(workerId: number) {
+  async function worker() {
     while (idx < begins.length) {
       const myIndex = idx++;
       const begin = begins[myIndex];
@@ -424,11 +496,9 @@ async function exportHomeownersCsvString(
           controller,
           `[${zip}] Page ${myIndex + 1}/${pages} parsed ${parsed.length} homeowner row(s).`
         );
-      } catch (err: any) {
-        line(
-          controller,
-          `[${zip}] Error fetching page at begin=${begin}: ${String(err?.message || err)}`
-        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        line(controller, `[${zip}] Error fetching page at begin=${begin}: ${msg}`);
         results[myIndex] = [];
       }
     }
@@ -436,7 +506,7 @@ async function exportHomeownersCsvString(
 
   const workers = Array.from(
     { length: Math.min(MAX_CONCURRENCY, begins.length) },
-    (_, i) => worker(i + 1)
+    () => worker()
   );
   await Promise.all(workers);
 
@@ -550,27 +620,27 @@ export async function POST(req: Request) {
           line(controller, `[${zip}] Deleting all leads (cleanup)…`);
           current = await getTotalLeadCount(token);
           await issueSingleDeleteAllExact(token, current);
-          const okDel = await pollUntilCountEquals(
+          const okDel2 = await pollUntilCountEquals(
             token,
             0,
             POLL_DELETE_TIMEOUT_MS,
             `delete:${zip}`,
             controller
           );
-          if (!okDel) throw new Error(`[${zip}] Timed out waiting for delete to finish (count->0).`);
+          if (!okDel2) throw new Error(`[${zip}] Timed out waiting for delete to finish (count->0).`);
           line(controller, `[${zip}] Cleanup delete complete.`);
           line(controller, `[${zip}] ✅ Finished.`);
         }
 
         line(controller, "\n🎉 Done.");
         controller.close();
-      } catch (err: any) {
-        line(controller, `ERROR: ${String(err?.message || err)}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        line(controller, `ERROR: ${msg}`);
         controller.close();
       }
     },
   });
-  
 
   return new Response(stream, {
     status: 200,
